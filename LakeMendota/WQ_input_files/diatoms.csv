@@ -1,0 +1,4 @@
+"domain","process","subprocess","model_coupled","parameter","default","unit","value","note"
+"water","growth","growth_rate","GOTM-Selmaprotbas","r0","1.3","d-1",2.2,"maximum growth rate at 20 degrees C"
+"water","growth","growth_rate","GLM-AED2","R_growth","?","d-1",2.3,"Phyto max growth rate @20C"
+"water","growth","growth_rate","Simstrat-AED2","R_growth","?","d-1",2.4,"Phyto max growth rate @20C"

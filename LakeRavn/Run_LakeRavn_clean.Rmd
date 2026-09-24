@@ -1,0 +1,474 @@
+---
+title: "LakeEnsemblR.WQ: Lake Mendota test case"
+author: "TBO"
+date: "2026-08-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, collapse = TRUE, comment = "#>")
+```
+
+## Purpose
+
+An end-to-end, reproducible workflow for LakeEnsemblR.WQ on the Lake Mendota
+test case (single inflow):
+
+1. Export the coupled model inputs.
+2. Validate the model setups.
+3. Run the model ensemble.
+4. Compute harmonized metrics.
+5. Sensitivity analysis, then calibration (LHC, optional DE, write-back, and
+   calibrating several coupled models at once).
+6. Compare and visualize model outputs against each other and observations.
+
+**How to run it:** knit or run this file from inside the test-case folder (the
+one that contains `LakeEnsemblR.yaml`, `LakeEnsemblR_WQ.yaml`, `Output.yaml`,
+the model folders and `standart_observed_data.csv`). No `setwd()` is needed
+because knitr uses the Rmd's own folder.
+
+## Prerequisites
+
+- A physical LakeEnsemblR setup (`LakeEnsemblR.yaml` and its input files).
+- A water-quality config file, `LakeEnsemblR_WQ.yaml`, and a metrics config
+  file, `Output.yaml`.
+- Model folders for the models you run: `GLM-AED2`, `GOTM-WET`,
+  `GOTM-Selmaprotbas`, `Simstrat-AED2`.
+- For calibration: an observed-data CSV with columns `datetime`, `depth`,
+  `variable_global_name`, `value`.
+
+```{r packages}
+library(LakeEnsemblR)    # remotes::install_github("tubabucak/LakeEnsemblR")
+library(LakeEnsemblR.WQ) # remotes::install_github("tubabucak/LakeEnsemblR.WQ")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Which optional model packages are installed? A missing one only matters if
+# you run the matching model.
+sapply(c("GLM3r", "WETr", "SelmaprotbasR", "SimstratR", "DEoptim"),
+       requireNamespace, quietly = TRUE)
+```
+
+### Run settings
+
+`quick = TRUE` uses tiny sample sizes so the whole document finishes fast and
+proves the workflow works. Set `quick = FALSE` for a real calibration. Rule of
+thumb for DE: `de_popsize` should be roughly 10x the number of calibrated
+parameters (see `?DEoptim::DEoptim.control`).
+
+```{r settings}
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+quick    <- TRUE
+obs_file <- "standart_observed_data.csv"   # datetime, depth, variable_global_name, value
+models   <- c("GLM-AED2", "SIMSTRAT-AED2", "GOTM-Selmaprotbas", "GOTM-WET")
+
+n_cores <- max(1L, min(4L, parallel::detectCores(logical = FALSE) - 1L))
+cfg <- if (quick) {
+  list(lhc_seq = 4,   lhc_par = 8,   workers = min(2L, n_cores),
+       de_pop = 4,    de_iter = 2,   sens_steps = 5)
+} else {
+  list(lhc_seq = 50,  lhc_par = 300, workers = n_cores,
+       de_pop = 60,   de_iter = 30,  sens_steps = 10)
+}
+
+set.seed(123)   # Latin hypercube sampling and DE are random
+```
+
+## 1) Export WQ configuration and inputs
+
+```{r export}
+export_config("LakeEnsemblR.yaml", model = c("GLM", "GOTM", "Simstrat"))
+export_config_wq("LakeEnsemblR_WQ.yaml")
+```
+
+## 2) Validate model setups
+
+`run_ensemble_wq()` can do this itself with `validate = TRUE`. Calling the
+validators directly surfaces configuration errors before you commit to a full
+run.
+
+```{r validate}
+validate_glm_aed(sim_folder = "GLM-AED2", file = "glm3.nml", verbose = TRUE)
+validate_gotm_wet(sim_folder = "GOTM-WET", file = "gotm.yaml", verbose = TRUE)
+validate_gotm_wet(sim_folder = "GOTM-Selmaprotbas", file = "gotm.yaml", verbose = TRUE)
+validate_simstrat(sim_folder = "Simstrat-AED2", file = "simstrat.par", verbose = TRUE)
+```
+
+## 3) Run ensemble simulations
+
+```{r run-ensemble}
+run_res <- run_ensemble_wq(
+  config_file = "LakeEnsemblR_WQ.yaml",
+  models      = models,
+  folder      = ".",
+  validate    = TRUE,
+  verbose     = TRUE
+)
+```
+
+## 4) Compute metrics
+
+Run this again after calibration to compute the harmonized metrics with the
+calibrated parameters (see Section 5.6).
+
+```{r metrics}
+metric_out <- cal_metrics(
+  metric_yaml_file = "Output.yaml",
+  model_filter     = "all",
+  wq_config_file   = "LakeEnsemblR_WQ.yaml"
+)
+```
+
+## 5) Calibration workflow
+
+### 5.1 Generate calibration tables
+
+```{r calib-tables}
+create_calibration_tables(
+  folder         = ".",
+  config_file    = "LakeEnsemblR_WQ.yaml",
+  folder_out     = "calibration",
+  models_coupled = models,
+  bounds_factor  = 0.2
+)
+```
+
+Edit the module files in the `calibration` folder:
+
+- set `include = TRUE` for the parameters you want to calibrate
+- adjust `lower`, `upper` and `initial` as needed
+
+### 5.2 Build `calib_setup` from the edited tables
+
+```{r calib-setup}
+cs_all   <- calib_setup_from_tables(folder_in = "calibration", model_coupled = models)
+cs_selma <- subset(cs_all, model_coupled == "GOTM-Selmaprotbas")
+param_selma <- unique(cs_selma$pars)
+param_selma
+```
+
+### 5.3 Sensitivity analysis first
+
+Find which parameters actually matter before spending compute calibrating
+them. `output_mode = "raw"` needs only the model-native variable name (no
+`wq_config_file`). `group_name` restricts the change to one phytoplankton
+group.
+
+```{r sensitivity}
+run_sens <- function(param, vars, group_name = NULL, n_steps = cfg$sens_steps) {
+  args <- list(param_name = param, calib_setup = cs_selma, yaml_file = "Output.yaml",
+               model_dir = "GOTM-Selmaprotbas", n_steps = n_steps,
+               model = "GOTM-Selmaprotbas", output_mode = "raw", vars = vars)
+  if (!is.null(group_name)) args$group_name <- group_name
+  do.call(run_sensitivity, args)
+}
+
+sens <- list(
+  kc      = run_sens("kc",   "selmaprotbas_DO_mg"),                          # light extinction
+  pvel    = run_sens("pvel", "selmaprotbas_DO_mg"),                          # phytoplankton settling
+  r0_diat = run_sens("r0",   "total_chlorophyll_calculator_result", "diatoms")  # diatom growth only
+)
+```
+
+`plot_sensitivity()` draws one grey line per parameter value, a blue band for
+the 5-95% range across them, and the median. `sensitivity_to_long()` returns
+the same data as a tidy data frame if you want your own plot or numbers.
+
+```{r sens-plots}
+plot_sensitivity(sens$kc,      depth = 5, ylab = "DO (mg/m3)", title = "kc -> DO at 5 m")
+plot_sensitivity(sens$pvel,    depth = 2, ylab = "DO (mg/m3)", title = "pvel -> DO at 2 m")
+plot_sensitivity(sens$r0_diat, depth = 2, ylab = "Chl-a",      title = "diatom r0 -> total chlorophyll at 2 m")
+```
+
+A parameter whose envelope is a thin line has little effect on that variable
+and is a poor calibration candidate. Wide envelopes mark the parameters worth
+calibrating.
+
+### 5.4 Latin hypercube (LHC) calibration, one model
+
+`calib_wq()` samples the parameter space with Latin Hypercube Sampling, edits
+the model's own config files in `model_dir`, runs the model and scores every
+sample against the observations. It returns one row per sample and observed
+variable with NSE / RMSE / NRMSE / PBIAS / KGE. The model's config files are
+restored to their pre-calibration state when it returns, even on error.
+
+```{r lhc}
+res_lhc <- calib_wq(
+  model          = "GOTM-Selmaprotbas",
+  calib_setup    = cs_selma,
+  param_names    = param_selma,
+  yaml_file      = "Output.yaml",
+  model_dir      = "GOTM-Selmaprotbas",
+  n_samples      = cfg$lhc_seq,
+  wq_config_file = "LakeEnsemblR_WQ.yaml",
+  obs_file       = obs_file,
+  target_variables = "DO_gramsPerCubicMeter",
+  best_metric    = "KGE",
+  verbose        = TRUE
+)
+
+head(res_lhc)
+attr(res_lhc, "best_parameter_set")   # winning parameter set
+```
+
+### 5.5 Parallel LHC + Differential Evolution (DE) refinement
+
+`parallel = TRUE` spreads the LHC samples over worker processes. `use_de =
+TRUE` then runs DEoptim seeded with the best LHC samples. With DE,
+`attr(res, "best_parameter_set")` is DE's refined optimum and the LHC-phase
+best stays available under `attr(res, "lhc_best_parameter_set")`.
+
+Keep `n_samples >= de_popsize`, otherwise the seeded DE population repeats
+rows.
+
+```{r lhc-de}
+res <- calib_wq(
+  model            = models,
+  param_names      = param_selma,
+  calib_setup      = cs_selma,
+  yaml_file        = "Output.yaml",
+  model_dir        = "GOTM-Selmaprotbas",
+  obs_file         = obs_file,
+  wq_config_file   = "LakeEnsemblR_WQ.yaml",
+  target_variables = "DO_gramsPerCubicMeter",
+  best_metric      = "KGE",
+  stats_by_depth   = TRUE,
+  return_best      = TRUE,
+  verbose          = TRUE,
+  save_results     = FALSE,
+  parallel         = TRUE,
+  n_workers        = cfg$workers,
+  n_samples        = cfg$lhc_par,
+  use_de           = TRUE,
+  de_parallel      = TRUE,
+  de_n_workers     = cfg$workers,
+  de_popsize       = cfg$de_pop,
+  de_iterations    = cfg$de_iter
+)
+
+attr(res, "best_parameter_set")       # DE-refined best (used for write-back below)
+attr(res, "lhc_best_parameter_set")   # LHC-phase best, for comparison
+```
+
+**Where the logs are.** Worker processes have no console, so their output
+goes to files inside the model folder: `GOTM-Selmaprotbas/lhc_debug_logs/lhc_workers.log`
+(parallel LHC) and `GOTM-Selmaprotbas/de_debug_logs/de_workers.log` (DE).
+Open them when a run looks stuck or every score is the penalty value.
+
+### 5.6 Write the best parameters back
+
+`write_best_calib_to_par_files()` writes the best row (DE's if `use_de =
+TRUE`) into the module parameter files referenced by `LakeEnsemblR_WQ.yaml`,
+or directly into the model config files with `write_target = "config"`. Note
+that this **modifies your model files**: keep a copy if you want to return to
+the defaults. Re-run `export_config_wq()` afterwards to push the values all
+the way into the model folders.
+
+```{r write-back}
+write_best_calib_to_par_files(
+  lhc_results  = res,
+  calib_setup  = cs_selma,
+  config_file  = "LakeEnsemblR_WQ.yaml",
+  folder       = ".",
+  metric       = "KGE",
+  write_target = "config"
+)
+```
+
+Re-run the calibrated model so its output reflects the new parameters:
+
+```{r rerun}
+run_ensemble_wq(
+  config_file = "LakeEnsemblR_WQ.yaml",
+  models      = "GOTM-Selmaprotbas",
+  folder      = ".",
+  validate    = TRUE,
+  verbose     = TRUE
+)
+```
+
+### 5.7 Check the calibration against observations
+
+`plot_model_vs_obs_wq()` plots the simulation against the observations and
+returns the plot and the fit statistics. For `GOTM-Selmaprotbas` and
+`GOTM-WET`, zooplankton variables need `wq_config_file` so that the per-group
+outputs can be summed.
+
+```{r plot-vs-obs, fig.height=5}
+# model, variable_global_name (must match obs_file's column), axis title
+checks <- tibble::tribble(
+  ~model,              ~variable,                              ~title,
+  "GOTM-Selmaprotbas", "DO_gramsPerCubicMeter",                "DO (g/m3)",
+  "GOTM-Selmaprotbas", "NO3_gramsPerCubicMeter",               "NO3 (g/m3)",
+  "GOTM-Selmaprotbas", "NH4_gramsPerCubicMeter",               "NH4 (g/m3)",
+  "GOTM-Selmaprotbas", "TP_gramsPerCubicMeter",                "TP (g/m3)",
+  "GOTM-Selmaprotbas", "Total_Chla_miligramsPerCubicMeter",    "Chl-a (mg/m3)"
+)
+
+fit <- lapply(seq_len(nrow(checks)), function(i) {
+  out <- plot_model_vs_obs_wq(
+    config_file          = "Output.yaml",
+    model                = checks$model[i],
+    obs_data             = obs_file,
+    variable_global_name = checks$variable[i],
+    y_title              = checks$title[i],
+    wq_config_file       = "LakeEnsemblR_WQ.yaml"
+  )
+  print(out$plot)
+  out
+})
+names(fit) <- paste(checks$model, checks$variable, sep = " | ")
+```
+
+**Reading the statistics.** KGE, NSE and NRMSE are scale-free. RMSE is in the
+model's own units, e.g. mg O2/m3 for Selmaprotbas (the observations are
+converted with the dictionary `conversion_factor` when `obs_to_model_units =
+TRUE`). PBIAS is `100 * sum(obs - sim) / sum(obs)`, positive = the model
+underestimates, and it is not meaningful for variables that are often zero
+(anoxic DO).
+
+### 5.8 Calibrate all coupled models with `cali_ensemble_wq()`
+
+`cali_ensemble_wq()` is the multi-model wrapper around `calib_wq()`. Pass the
+full `models` vector and the combined `cs_all` table (split automatically by
+`model_coupled`) and it runs, scores and optionally writes back the best
+parameters for every model in one call.
+
+Models run sequentially by default. `parallel_models = TRUE` runs one worker
+process per model instead. It stacks with `parallel` / `de_parallel`, so size
+the worker counts so that `n_model_workers * n_workers` does not exceed your
+CPU cores. With `parallel_models = TRUE` progress is written to
+`<output_dir>/cali_ensemble_wq_workers.log`.
+
+```{r cali-ensemble}
+ens_models <- "GOTM-Selmaprotbas"   # add more, e.g. c("GOTM-WET", "GOTM-Selmaprotbas")
+
+result_all <- cali_ensemble_wq(
+  models           = models,
+  calib_setup      = cs_all,
+  yaml_file        = "Output.yaml",
+  folder           = ".",
+  n_samples        = cfg$lhc_seq,
+  n_workers        = cfg$workers,
+  use_de           = TRUE,
+  de_popsize       = cfg$de_pop,
+  de_iterations    = cfg$de_iter,
+  de_parallel      = TRUE,
+  de_n_workers     = cfg$workers,
+  parallel_models  = FALSE,
+  obs_file         = obs_file,
+  wq_config_file   = "LakeEnsemblR_WQ.yaml",
+  ler_config_file  = "LakeEnsemblR.yaml",
+  target_variables = "DO_gramsPerCubicMeter",
+  best_metric      = "KGE",
+  parallel         = TRUE,
+  force_parallel_glm_simstrat = TRUE,
+  verbose          = TRUE,
+  on_error         = "skip",
+  save_results     = TRUE,
+  output_dir       = "calibration_results",
+  write_best       = TRUE,
+  write_target     = "config"
+)
+
+result_all$summary                                  # any failures or skips?
+sapply(result_all$best_parameter_sets,              # final objective per model
+       function(x) if (!is.null(x)) x$objective_value)
+```
+
+**DE convergence.** `bestvalit` is the best (minimized) objective per
+generation. It can only stay flat or improve. If it is still falling at the
+last generation, raise `de_iterations`. If it is flat from the start, the seeded
+LHC starting point was already near the optimum, or `de_popsize` is too small
+to explore.
+
+```{r de-convergence, fig.height=4}
+plot_de_convergence <- function(result) {
+  for (m in names(result$results)) {
+    de_obj <- attr(result$results[[m]], "de_phase")
+    if (is.null(de_obj)) {
+      message(m, ": no DE phase found (model failed, or DE was off)")
+      next
+    }
+    bv <- de_obj$member$bestvalit
+    plot(bv, type = "l", lwd = 2, xlab = "DE generation",
+         ylab = "objective (minimized)", main = m)
+    if (length(bv) >= 3) {
+      total <- bv[1] - bv[length(bv)]
+      tail2 <- bv[length(bv) - 2] - bv[length(bv)]
+      message(sprintf("%s: total improvement %.4f, last 2 generations %.4f (%.0f%% of total)",
+                      m, total, tail2, 100 * tail2 / total))
+    }
+  }
+}
+plot_de_convergence(result_all)
+```
+
+## 6) Compare and visualize model outputs
+
+These plug directly into `cal_metrics()`'s nested list (Section 4) and the
+NetCDF file from `create_netcdf_output()`.
+
+### 6.1 Combine all models into one NetCDF
+
+```{r netcdf}
+metric_out <- cal_metrics(
+  metric_yaml_file = "Output.yaml",
+  model_filter     = "all",
+  wq_config_file   = "LakeEnsemblR_WQ.yaml"
+)
+
+create_netcdf_output(
+  output_lists    = metric_out,
+  folder          = ".",
+  model           = c("GLM", "SELMAPROTBAS", "WET", "SIMSTRAT"),
+  ler_config_file = "LakeEnsemblR.yaml",
+  wq_config_file  = "LakeEnsemblR_WQ.yaml",
+  out_file        = "ensemble_output.nc"
+)
+```
+
+### 6.2 Compare one metric across models
+
+`compare_models_metric()` takes the `cal_metrics()` list directly.
+`compare_models_metric_netcdf()` reads from the NetCDF instead, which is useful
+for a variable that is not in `Output.yaml`.
+
+```{r compare}
+compare_models_metric(metric_out, metric = "Temp_degreeCelcius", depth = 1)$plot
+
+```
+
+### 6.3 Stratification, heatmaps, anoxia and ice
+
+`plot_strat_metrics()`, `plot_anoxic_metrics()` and `plot_ice_metrics()` take
+either the `cal_metrics()` list or a NetCDF path. `plot_heatmap_wq()` draws a
+depth-time heatmap faceted by model; use any metric name present in
+`Output.yaml`.
+
+```{r strat-heatmap-anoxia}
+strat <- plot_strat_metrics(metric_out, metric_name = "Duration_of_Stratification")
+strat$duration_plot
+strat$onset_plot
+strat$mixing_plot
+
+plot_heatmap_wq("output/ensemble_output.nc", "Temp_degreeCelcius", spin_up = 30)
+plot_heatmap_wq("output/ensemble_output.nc", "DO_gramsPerCubicMeter", spin_up = 30)
+
+plot_anoxic_metrics("output/ensemble_output.nc")
+plot_ice_metrics("outputensemble_output.nc", metric_name = "Ice_Thickness_meter")
+```
+
+### 6.4 Lower-level time-series and scatter plots
+
+`compare_plot()` and `scat_plot()` take one wide-format data frame per model
+(`datetime` plus `Depth_<n>` columns, the shape `get_output_wq()` returns) and
+one for the observations, and compute `cal_stats()` internally. See
+`?compare_plot` and `?scat_plot` for the exact requirements.
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
